@@ -386,20 +386,14 @@ class CRIClient:
             logger.info("Received: %s", message)
 
         if (notification := self.parser.parse_message(message)) is not None:
-            if notification["answer"] == "status":
-                if self.status_callback is not None:
-                    self.status_callback(self.robot_state)
-                    return None
-                else:
-                    return None
+            if notification["answer"] == "status" and self.status_callback is not None:
+                self.status_callback(self.robot_state)
 
-            if notification["answer"] == "CAN":
+            elif notification["answer"] == "CAN":
                 self.can_queue.put_nowait(notification["can"])
-                return None
 
-            if notification["answer"] == "info_filelist":
+            elif notification["answer"] == "info_filelist":
                 self.file_list = self.parser.file_list
-                return None
 
             with self.answer_events_lock:
                 msg_id = notification["answer"]
@@ -409,7 +403,7 @@ class CRIClient:
                         self.error_messages[msg_id] = error_msg
 
                     self.answer_events[msg_id].set()
-                else:
+                elif msg_id != "status":
                     logger.info("Not registered answer message received: %s", msg_id)
         return None
 
