@@ -17,6 +17,8 @@ from .robot_state import KinematicsState, ReplayMode, RobotState
 
 logger = logging.getLogger(__name__)
 
+STATUS_CATEGORIES = ("STATUS", "RUNSTATE", "CRISTART", "VARIABLES")
+
 
 _thread_local = threading.local()
 
@@ -238,7 +240,10 @@ class CRIClient:
         try:
             with self.socket_write_lock:
                 self.sock.sendall(message.encode())
-            logger.debug("Sent command: %s", message)
+            if "ALIVEJOG" in command:
+                logger.debug("Sent command: %s", message)
+            else:
+                logger.info("Sent command: %s", message)
 
             return command_counter
 
@@ -377,16 +382,24 @@ class CRIClient:
         """Internal function to parse a message. If an answer event is registered for a certain msg_id it is triggered."""
         if "STATUS" not in message:
             logger.debug("Received: %s", message)
+        if STATUS_CATEGORIES not in message:
+            logger.info("Received: %s", message)
 
         if (notification := self.parser.parse_message(message)) is not None:
-            if notification["answer"] == "status" and self.status_callback is not None:
-                self.status_callback(self.robot_state)
+            if notification["answer"] == "status":
+                if self.status_callback is not None:
+                    self.status_callback(self.robot_state)
+                    return None
+                else:
+                    return None
 
             if notification["answer"] == "CAN":
                 self.can_queue.put_nowait(notification["can"])
+                return None
 
             if notification["answer"] == "info_filelist":
                 self.file_list = self.parser.file_list
+                return None
 
             with self.answer_events_lock:
                 msg_id = notification["answer"]
@@ -396,6 +409,10 @@ class CRIClient:
                         self.error_messages[msg_id] = error_msg
 
                     self.answer_events[msg_id].set()
+                else:
+                    logger.info("Not registered answer message received: %s", msg_id)
+        return None
+
 
     async def wait_for_status_update_async(self, timeout: float | None = None) -> None:
         """Wait for next STATUS message.
