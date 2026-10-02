@@ -9,7 +9,7 @@ from enum import Enum
 from pathlib import Path
 from queue import Empty, Queue
 from time import sleep, time
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Literal, Coroutine
 
 from .cri_errors import CRICommandError, CRICommandTimeOutError, CRIConnectionError
 from .cri_protocol_parser import CRIProtocolParser
@@ -19,11 +19,18 @@ logger = logging.getLogger(__name__)
 
 STATUS_CATEGORIES = ("STATUS", "RUNSTATE", "CRISTART", "VARIABLES")
 
+class MachineState(Enum):
+    IDLE = 0
+    STARTING = 1
+    RUNNING = 2
+    PAUSED = 3
+    ENDED = 4
+    ERROR = 5
 
 _thread_local = threading.local()
 
 
-def _run_sync(coro):
+def _run_sync(coro: Coroutine[Any, Any, Any]) -> Any:
     """Runs a coroutine to completion on a per-thread event loop.
 
     ``asyncio.get_event_loop()`` no longer creates a loop implicitly (Python 3.14+),
@@ -74,6 +81,9 @@ class CRIClient:
         """
         self.robot_state: RobotState = RobotState()
         self.robot_state_lock = threading.Lock()
+
+        # --- State Machine ---
+        self.machine_state: MachineState = MachineState.IDLE
 
         self.file_list: list = []
         self.file_list_lock: threading.Lock = threading.Lock()
@@ -395,6 +405,23 @@ class CRIClient:
             elif notification["answer"] == "info_filelist":
                 self.file_list = self.parser.file_list
 
+            elif (exec_signal := notification["answer"]) in (
+                "EXECACK",
+                "EXECPAUSE",
+                "EXECEND",
+                "MOVETOEXECPAUSE",
+                "MOVETOEXECEND",
+            ):
+                match exec_signal:
+                    case "EXECACK":
+                        self.machine_state = MachineState.RUNNING
+                    case ("EXECPAUSE" | "MOVETOEXECPAUSE"):
+                        self.machine_state = MachineState.PAUSED
+                    case ("EXECEND" | "MOVETOEXECEND"):
+                        self.machine_state = MachineState.ENDED
+                    case _:
+                        pass
+
             with self.answer_events_lock:
                 msg_id = notification["answer"]
 
@@ -405,6 +432,8 @@ class CRIClient:
                     self.answer_events[msg_id].set()
                 elif msg_id != "status":
                     logger.info("Not registered answer message received: %s", msg_id)
+                    if debug_msg := notification.get("debug", False):
+                        logger.debug(debug_msg)
         return None
 
 

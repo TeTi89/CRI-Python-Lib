@@ -109,7 +109,12 @@ class CRIProtocolParser:
             ):
                 # the messages doesn't contain a command message ID,
                 # therefore only the category can be subscribed to.
-                result = {"answer": str(cmd_category)}
+                result = {
+                    "answer": str(cmd_category),
+                    # the "EXEC-" message still contain useful information about the running state of the robot.
+                    # use result.get("debug") to get the information
+                    "debug": " ".join(parts[2:-1]),
+                }
 
             case "EXECERROR" | "MOVETOEXECERROR":
                 result = self._parse_execerror(parts[3:-1])
