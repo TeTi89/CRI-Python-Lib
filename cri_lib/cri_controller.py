@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from queue import Empty, Queue
-from time import sleep, time
+from time import monotonic, sleep, time
 from typing import Any, Callable, Literal, Coroutine
 
 from .cri_errors import CRICommandError, CRICommandTimeOutError, CRIConnectionError
@@ -27,6 +27,7 @@ class MachineState(Enum):
     ENDED = 4
     ERROR = 5
 
+# Thread-local data that stores the event loop in which all commands run.
 _thread_local = threading.local()
 
 
@@ -97,8 +98,9 @@ class CRIClient:
         self.can_mode: bool = False
         self.can_queue: Queue = Queue()
 
+        # --- Background Thread ---
         self.jog_thread = threading.Thread(target=self._bg_alivejog_thread, daemon=True)
-        self.jog_intervall = self.ALIVE_JOG_INTERVAL_SEC
+        self.jog_interval = self.ALIVE_JOG_INTERVAL_SEC
         self.receive_thread = threading.Thread(
             target=self._bg_receive_thread, daemon=True
         )
@@ -136,7 +138,7 @@ class CRIClient:
         -------
         bool
             True if connected.
-            Otherwise an exception is raised.
+            Otherwise, an exception is raised.
 
         Raises
         ------
@@ -198,6 +200,18 @@ class CRIClient:
     def _register_answer(self, answer_id: str) -> None:
         with self.answer_events_lock:
             self.answer_events[answer_id] = asyncio.Event()
+
+    def _unregister_answer(self, answer_id: str) -> None:
+        """Discard a registered answer that nobody will wait for anymore."""
+        with self.answer_events_lock:
+            try:
+                del self.answer_events[answer_id]
+            except KeyError:
+                logger.info("No answer registered for %s", answer_id)
+            try:
+                del self.error_messages[answer_id]
+            except KeyError:
+                pass
 
     def _send_command(
         self,
@@ -278,7 +292,7 @@ class CRIClient:
                 self.connected = False
                 return
 
-            sleep(self.jog_intervall)
+            sleep(self.jog_interval)
 
     def _bg_receive_thread(self) -> None:
         """
@@ -356,7 +370,7 @@ class CRIClient:
 
         Raises
         ------
-        CRITimeoutError
+        CRICommandTimeOutError # typo
             raised if no answer was received in given timeout
 
         """
@@ -379,14 +393,13 @@ class CRIClient:
 
         # prevent deadlock through answer_events_lock
         with self.answer_events_lock:
-            del self.answer_events[message_id]
+            try:
+                del self.answer_events[message_id]
+            except KeyError:
+                logger.info("No answer registered for %s", message_id)
 
-            if message_id in self.error_messages:
-                error_msg = self.error_messages[message_id]
-                del self.error_messages[message_id]
-                return error_msg
-            else:
-                return None
+            error_msg = self.error_messages.pop(message_id, None)
+            return error_msg
 
     def _parse_message(self, message: str) -> None:
         """Internal function to parse a message. If an answer event is registered for a certain msg_id it is triggered."""
@@ -614,6 +627,9 @@ class CRIController(CRIClient):
         }
         self.jog_speeds_lock = threading.Lock()
         self.file_list: list = []
+        # --- new mechanisms to stop a function with wait_move_finished
+        # set by `stop_move()`: a move waiting for its end returns False.
+        self.stop_move_event = threading.Event()
         super().__init__()
 
     def _bg_alivejog_thread(self) -> None:
@@ -652,10 +668,55 @@ class CRIController(CRIClient):
         else:
             return True
 
+    def _get_expected_response(self) -> str:
+        core_ver = self.robot_state.robot_control_version
+        if core_ver.startswith(("V980-14", "V980-13")):
+            return "EXECEND"
+        else:
+            return "MOVETOEXECEND"
+
+    async def _wait_move_finished_async(
+            self, expected_response: str, timeout: float | None,
+            operation_name: str = __name__
+    ) -> bool:
+        """Wait for the end of a move, or for `stop_move()`, whichever comes first.
+
+        Returns True when the move ended normally, False on an execution error
+        or when `move_stop_event` was set. The answer is always unregistered,
+        also on timeout or when the waiting task is canceled.
+        """
+        if timeout is None:
+            timeout = 24 * 3600
+        with self.answer_events_lock:
+            end_event = self.answer_events[expected_response]
+        deadline = monotonic() + timeout
+
+        try:
+            while not end_event.is_set(): # set when move ended normally
+                if self.stop_move_event.is_set():
+                    logger.debug("%s: stopped by stop_move", operation_name)
+                    return False
+                if monotonic() > deadline:
+                    raise CRICommandTimeOutError(
+                        f"{operation_name}: move did not finish within {timeout} s."
+                    )
+                await asyncio.sleep(0.001) # ↺ check again after 1ms
+
+            with self.answer_events_lock:
+                error_msg = self.error_messages.pop(expected_response, None)
+            if error_msg is not None:
+                logger.debug("Exec Error in %s command: %s", operation_name, error_msg)
+                return False
+            return True
+        finally:
+            with self.answer_events_lock:
+                if self.answer_events.get(expected_response) is end_event:
+                    del self.answer_events[expected_response]
+
     async def enable_async(self) -> bool:
         """Enable robot activates the motors.
 
-        An potential error message received from the robot will be logged with priority DEBUG
+        A potential error message received from the robot will be logged with priority DEBUG
 
         Returns
         -------
@@ -836,19 +897,10 @@ class CRIController(CRIClient):
             f"CMD Move Joint {A1} {A2} {A3} {A4} {A5} {A6} {E1} {E2} {E3} {velocity}"
         )
 
-        if (
-            (acceleration is not None)
-            and (acceleration >= 0.0)
-            and (acceleration <= 100.0)
-        ):
+        if acceleration is not None and 0.0<=acceleration <= 100.0: # python 3.10 support chained comparison:
             command = f"{command} {acceleration}"
 
-        core_ver = self.robot_state.robot_control_version
-        if core_ver.startswith("V980-14") or core_ver.startswith("V980-13"):
-            expected_response = "EXECEND"
-        else:
-            expected_response = "MOVETOEXECEND"
-
+        expected_response = self._get_expected_response()
         if wait_move_finished:
             self._register_answer(expected_response)
 
@@ -867,6 +919,59 @@ class CRIController(CRIClient):
             ) is not None:
                 logger.debug("Exec Error in Move Joints command: %s", error_msg)
                 return False
+        return True
+
+    async def move_joints_async_stoppable(
+        self,
+        A1: float,
+        A2: float,
+        A3: float,
+        A4: float,
+        A5: float,
+        A6: float,
+        E1: float,
+        E2: float,
+        E3: float,
+        velocity: float,
+        wait_move_finished: bool = False,
+        move_finished_timeout: float | None = 300.0,
+        acceleration: float | None = None,
+    ) -> bool | Coroutine[Any, Any, bool]:
+        """Absolute joint move
+
+        unlike move_joints_async, if wait_move_finished is set True, this function
+        will return a coroutine and do no blocking. Keep running the coroutine in another thread
+        will give the result of if the movement is done.
+        """
+        command = (
+            f"CMD Move Joint {A1} {A2} {A3} {A4} {A5} {A6} {E1} {E2} {E3} {velocity}"
+        )
+
+        if acceleration is not None and 0.0<=acceleration <= 100.0: # python 3.10 support chained comparison:
+            command = f"{command} {acceleration}"
+
+        expected_response = self._get_expected_response()
+        if wait_move_finished:
+            self._register_answer(expected_response)
+
+        error_msg = None
+        try:
+            msg_id = self._send_command(command, True)
+            error_msg = await self._wait_for_answer_async(msg_id, timeout=30.0)
+        except CRICommandTimeOutError:
+            if wait_move_finished:
+                self._unregister_answer(expected_response)
+                logger.debug("Timeout while waiting for CMDACK from robot controller.")
+        if error_msg is not None:
+            logger.debug("Error in Move Joints command: %s", error_msg)
+            if wait_move_finished:
+                self._unregister_answer(expected_response)
+            return False
+
+        if wait_move_finished:
+            return await self._wait_move_finished_async(
+                expected_response, timeout=move_finished_timeout,
+            )
         return True
 
     async def move_joints_relative_async(
@@ -908,19 +1013,10 @@ class CRIController(CRIClient):
         """
         command = f"CMD Move RelativeJoint {A1} {A2} {A3} {A4} {A5} {A6} {E1} {E2} {E3} {velocity}"
 
-        if (
-            (acceleration is not None)
-            and (acceleration >= 0.0)
-            and (acceleration <= 100.0)
-        ):
+        if acceleration is not None and 0.0<=acceleration <= 100.0:
             command = f"{command} {acceleration}"
 
-        core_ver = self.robot_state.robot_control_version
-        if core_ver.startswith("V980-14") or core_ver.startswith("V980-13"):
-            expected_response = "EXECEND"
-        else:
-            expected_response = "MOVETOEXECEND"
-
+        expected_response = self._get_expected_response()
         if wait_move_finished:
             self._register_answer(expected_response)
 
@@ -988,19 +1084,10 @@ class CRIController(CRIClient):
             f"CMD Move Cart {X} {Y} {Z} {A} {B} {C} {E1} {E2} {E3} {velocity} {frame}"
         )
 
-        if (
-            (acceleration is not None)
-            and (acceleration >= 0.0)
-            and (acceleration <= 100.0)
-        ):
+        if acceleration is not None and 0.0<=acceleration <= 100.0:
             command = f"{command} {acceleration}"
 
-        core_ver = self.robot_state.robot_control_version
-        if core_ver.startswith("V980-14") or core_ver.startswith("V980-13"):
-            expected_response = "EXECEND"
-        else:
-            expected_response = "MOVETOEXECEND"
-
+        expected_response = self._get_expected_response()
         if wait_move_finished:
             self._register_answer(expected_response)
 
@@ -1065,19 +1152,10 @@ class CRIController(CRIClient):
         """
         command = f"CMD Move RelativeBase {X} {Y} {Z} {A} {B} {C} {E1} {E2} {E3} {velocity} {frame}"
 
-        if (
-            (acceleration is not None)
-            and (acceleration >= 0.0)
-            and (acceleration <= 100.0)
-        ):
+        if acceleration is not None and 0.0 <= acceleration <= 100.0:
             command = f"{command} {acceleration}"
 
-        core_ver = self.robot_state.robot_control_version
-        if core_ver.startswith("V980-14") or core_ver.startswith("V980-13"):
-            expected_response = "EXECEND"
-        else:
-            expected_response = "MOVETOEXECEND"
-
+        expected_response = self._get_expected_response()
         if wait_move_finished:
             self._register_answer(expected_response)
 
@@ -1142,19 +1220,10 @@ class CRIController(CRIClient):
         """
         command = f"CMD Move RelativeTool {X} {Y} {Z} {A} {B} {C} {E1} {E2} {E3} {velocity} {frame}"
 
-        if (
-            (acceleration is not None)
-            and (acceleration >= 0.0)
-            and (acceleration <= 100.0)
-        ):
+        if acceleration is not None and 0.0<=acceleration <= 100.0: # python 3.10 support chained comparison
             command = f"{command} {acceleration}"
 
-        core_ver = self.robot_state.robot_control_version
-        if core_ver.startswith("V980-14") or core_ver.startswith("V980-13"):
-            expected_response = "EXECEND"
-        else:
-            expected_response = "MOVETOEXECEND"
-
+        expected_response = self._get_expected_response()
         if wait_move_finished:
             self._register_answer(expected_response)
 
@@ -1193,6 +1262,7 @@ class CRIController(CRIClient):
             logger.debug("Error in Move Stop command: %s", error_msg)
             return False
         else:
+            self.stop_move_event.set() # tell waiter functions to stop and cleanup
             return True
 
     def start_jog(self):
@@ -1382,7 +1452,7 @@ class CRIController(CRIClient):
         else:
             return True
 
-    async def load_programm_async(self, program_name: str) -> bool:
+    async def load_program_async(self, program_name: str) -> bool:
         """Load a program file from disk into the robot controller.
 
         This starts the program loading process on the core, therefore the
@@ -1411,7 +1481,7 @@ class CRIController(CRIClient):
         else:
             return True
 
-    async def load_logic_programm_async(self, program_name: str) -> bool:
+    async def load_logic_program_async(self, program_name: str) -> bool:
         """Load a logic program file from disk into the robot controller.
 
         This starts the program loading process on the core, therefore the
@@ -1461,7 +1531,7 @@ class CRIController(CRIClient):
                 raise CRICommandError(f"Could not set replay mode: {error_msg}")
             await asyncio.sleep(0.05)
 
-    async def start_programm_async(
+    async def start_program_async(
         self, *, replay_mode: ReplayMode | None = None
     ) -> bool:
         """Start currently loaded Program.
@@ -1495,7 +1565,54 @@ class CRIController(CRIClient):
         else:
             return True
 
-    async def stop_programm_async(self) -> bool:
+    async def run_program_async(
+        self, wait_move_finished: bool = False,
+        *,
+        move_finished_timeout: float | None = 300.0,
+        replay_mode: ReplayMode | None = None,
+    ) -> bool | Coroutine[Any, Any, bool]:
+        """Start currently loaded Program.
+
+        Unlike start_program_async, if wait_move_finished is set to True,
+        this function returns a coroutine and does not block. Running the
+        coroutine in another thread will indicate whether the program is finished
+        by returning True or False. Returning False directly means the command
+        was not acknowledged by the robot controller.
+        """
+        if replay_mode is not None:
+            if wait_move_finished and replay_mode != ReplayMode.SINGLE:
+                logger.warning("wait_move_finished option is only possible in SINGLE mode")
+                return False
+            await self.set_replay_mode_async(replay_mode)
+
+        command = "CMD StartProgram"
+
+        expected_response = self._get_expected_response()
+        if wait_move_finished:
+            self._register_answer(expected_response)
+
+        error_msg = None
+        try:
+            msg_id = self._send_command(command, True)
+            error_msg = await self._wait_for_answer_async(msg_id, timeout=30.0)
+        except CRICommandTimeOutError:
+            if wait_move_finished:
+                self._unregister_answer(expected_response)
+                logger.debug("Timeout while waiting for CMDACK from robot controller.")
+        if error_msg is not None:
+            logger.debug("Error in start_program command: %s", error_msg)
+            if wait_move_finished:
+                self._unregister_answer(expected_response)
+            return False
+
+        if wait_move_finished:
+            return await self._wait_move_finished_async(
+                expected_response, timeout=move_finished_timeout,
+            )
+        return True
+
+
+    async def stop_program_async(self) -> bool:
         """Stop currently running Program
 
         Returns
@@ -1513,7 +1630,7 @@ class CRIController(CRIClient):
         else:
             return True
 
-    async def pause_programm_async(self) -> bool:
+    async def pause_program_async(self) -> bool:
         """Pause currently running Program
 
         Returns
@@ -1879,25 +1996,25 @@ class CRIController(CRIClient):
         """Blocking wrapper around :func:`CRIController.set_global_signal_async`."""
         return _run_sync(self.set_global_signal_async(id=id, value=value))
 
-    def load_programm(self, program_name: str) -> bool:
+    def load_program(self, program_name: str) -> bool:
         """Blocking wrapper around :func:`CRIController.load_programm_async`."""
-        return _run_sync(self.load_programm_async(program_name))
+        return _run_sync(self.load_program_async(program_name))
 
-    def load_logic_programm(self, program_name: str) -> bool:
+    def load_logic_program(self, program_name: str) -> bool:
         """Blocking wrapper around :func:`CRIController.load_logic_programm_async`."""
-        return _run_sync(self.load_logic_programm_async(program_name))
+        return _run_sync(self.load_logic_program_async(program_name))
 
-    def start_programm(self, *, replay_mode: ReplayMode | None = None) -> bool:
+    def start_program(self, *, replay_mode: ReplayMode | None = None) -> bool:
         """Blocking wrapper around :func:`CRIController.start_programm_async`."""
-        return _run_sync(self.start_programm_async(replay_mode=replay_mode))
+        return _run_sync(self.start_program_async(replay_mode=replay_mode))
 
-    def stop_programm(self) -> bool:
+    def stop_program(self) -> bool:
         """Blocking wrapper around :func:`CRIController.stop_programm_async`."""
-        return _run_sync(self.stop_programm_async())
+        return _run_sync(self.stop_program_async())
 
-    def pause_programm(self) -> bool:
+    def pause_program(self) -> bool:
         """Blocking wrapper around :func:`CRIController.pause_programm_async`."""
-        return _run_sync(self.pause_programm_async())
+        return _run_sync(self.pause_program_async())
 
 
 # Monkey patch to maintain backward compatibility
