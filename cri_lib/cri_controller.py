@@ -1997,23 +1997,23 @@ class CRIController(CRIClient):
         return _run_sync(self.set_global_signal_async(id=id, value=value))
 
     def load_program(self, program_name: str) -> bool:
-        """Blocking wrapper around :func:`CRIController.load_programm_async`."""
+        """Blocking wrapper around :func:`CRIController.load_program_async`."""
         return _run_sync(self.load_program_async(program_name))
 
     def load_logic_program(self, program_name: str) -> bool:
-        """Blocking wrapper around :func:`CRIController.load_logic_programm_async`."""
+        """Blocking wrapper around :func:`CRIController.load_logic_program_async`."""
         return _run_sync(self.load_logic_program_async(program_name))
 
     def start_program(self, *, replay_mode: ReplayMode | None = None) -> bool:
-        """Blocking wrapper around :func:`CRIController.start_programm_async`."""
+        """Blocking wrapper around :func:`CRIController.start_program_async`."""
         return _run_sync(self.start_program_async(replay_mode=replay_mode))
 
     def stop_program(self) -> bool:
-        """Blocking wrapper around :func:`CRIController.stop_programm_async`."""
+        """Blocking wrapper around :func:`CRIController.stop_program_async`."""
         return _run_sync(self.stop_program_async())
 
     def pause_program(self) -> bool:
-        """Blocking wrapper around :func:`CRIController.pause_programm_async`."""
+        """Blocking wrapper around :func:`CRIController.pause_program_async`."""
         return _run_sync(self.pause_program_async())
 
 
