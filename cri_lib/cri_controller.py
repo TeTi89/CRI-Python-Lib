@@ -10,7 +10,7 @@ from enum import Enum
 from pathlib import Path
 from queue import Empty, Queue
 from time import monotonic, sleep, time
-from typing import Any, Callable, Literal, Coroutine, Concatenate, ParamSpec, TypeVar, Awaitable
+from typing import Any, Callable, Literal, Coroutine, ParamSpec, TypeVar
 
 from .cri_errors import CRICommandError, CRICommandTimeOutError, CRIConnectionError
 from .cri_protocol_parser import CRIProtocolParser
@@ -46,17 +46,17 @@ def _run_sync(coro: Coroutine[Any, Any, Any]) -> Any:
 
 P = ParamSpec("P")
 R = TypeVar("R")
-S = TypeVar("S")
 
 def blocking_wrapper(
-    async_fn: Callable[Concatenate[S, P], Awaitable[R]],
-) -> Callable[Concatenate[S, P], R]:
+    async_fn: Callable[P, Coroutine[Any, Any, R]]
+) -> Callable[P, R]:
     """Create a blocking twin of an ``*_async`` method."""
     name = async_fn.__name__
 
     @functools.wraps(async_fn)
-    def wrapper(self: S, *args: P.args, **kwargs: P.kwargs) -> R:
-        return _run_sync(getattr(self, name)(*args, **kwargs))
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+        self, *rest = args
+        return _run_sync(getattr(self, name)(*rest, **kwargs))
 
     wrapper.__doc__ = f"Blocking wrapper around :meth:`{async_fn.__qualname__}`."
     return wrapper
@@ -1798,6 +1798,7 @@ class CRIController(CRIClient):
     load_program = blocking_wrapper(load_program_async)
     load_logic_program = blocking_wrapper(load_logic_program_async)
     start_program = blocking_wrapper(start_program_async)
+    run_program = blocking_wrapper(run_program_async)
     stop_program = blocking_wrapper(stop_program_async)
     pause_program = blocking_wrapper(pause_program_async)
 
